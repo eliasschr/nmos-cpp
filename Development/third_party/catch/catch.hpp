@@ -2054,8 +2054,14 @@ namespace Catch{
         #define CATCH_TRAP() \
                 __asm__("li r0, 20\nsc\nnop\nli r0, 37\nli r4, 2\nsc\nnop\n" \
                 : : : "memory","r0","r3","r4" ) /* NOLINT */
-    #else
+    #elif defined(__i386__) || defined(__x86_64__)
         #define CATCH_TRAP() __asm__("int $3\n" : : /* NOLINT */ )
+    #else
+        // Catch v1.10.0 predates Apple Silicon. Its original macOS fallback
+        // assumed every non-PowerPC target was x86; use the portable POSIX
+        // trap path for other macOS architectures instead.
+        #include <signal.h>
+        #define CATCH_TRAP() raise(SIGTRAP)
     #endif
 
 #elif defined(CATCH_PLATFORM_LINUX)
@@ -7215,7 +7221,10 @@ namespace Catch {
 namespace Catch {
 
     struct RandomNumberGenerator {
-        typedef std::ptrdiff_t result_type;
+        // std::shuffle requires a UniformRandomBitGenerator, whose result_type
+        // must be an unsigned integer type. Older libc++ accepted ptrdiff_t;
+        // current libc++ correctly rejects that signed type.
+        typedef unsigned int result_type;
 
         result_type operator()( result_type n ) const { return std::rand() % n; }
 
