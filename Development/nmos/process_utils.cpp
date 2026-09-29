@@ -1,6 +1,6 @@
 #include "nmos/process_utils.h"
 
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
 
 // boost::this_process::get_id() would be perfect, except that Boost.Process was only introduced in Boost 1.64.0
@@ -28,7 +28,7 @@ namespace nmos
         // Wait for a process termination signal
         void wait_term_signal()
         {
-            boost::asio::io_service service;
+            boost::asio::io_context service;
             // Ctrl+C generates SIGINT on both Linux and Windows
             // On Windows, closing the console window generates SIGBREAK
             // On Linux, the kill command generates SIGTERM by default

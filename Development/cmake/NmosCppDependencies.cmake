@@ -42,6 +42,15 @@ endif()
 # Boost_LIBRARIES is provided by the CMake FindBoost.cmake module and recently also by Conan for most generators
 # but with cmake_find_package_multi it isn't, and mapping the required components to targets seems robust anyway
 string(REGEX REPLACE "([^;]+)" "Boost::\\1" BOOST_TARGETS "${FIND_BOOST_COMPONENTS}")
+
+# Boost.System has been header-only since Boost 1.69 and its compiled stub
+# library was removed in Boost 1.89. Some package generators therefore no
+# longer provide a Boost::system target.
+if(Boost_VERSION VERSION_GREATER_EQUAL "1.69.0" AND NOT TARGET Boost::system)
+    list(REMOVE_ITEM BOOST_TARGETS Boost::system)
+    message(STATUS "Boost::system target not available; using header-only Boost.System")
+endif()
+
 message(STATUS "Using Boost targets ${BOOST_TARGETS}, not Boost libraries ${Boost_LIBRARIES}")
 
 # this target means the nmos-cpp libraries can just link a single Boost dependency

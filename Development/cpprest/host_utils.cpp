@@ -1,7 +1,7 @@
 #include "cpprest/host_utils.h"
 
 #include <iomanip> // for std::setfill
-#include <boost/asio/io_service.hpp>
+#include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/host_name.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/range/adaptor/filtered.hpp>
@@ -287,7 +287,7 @@ namespace web
 
             std::vector<utility::string_t> host_names(const utility::string_t& address)
             {
-                boost::asio::io_service service;
+                boost::asio::io_context service;
                 boost::asio::ip::tcp::resolver resolver(service);
                 std::vector<utility::string_t> host_names;
                 boost::system::error_code ec;
@@ -312,12 +312,12 @@ namespace web
 
             std::vector<utility::string_t> host_addresses(const utility::string_t& host_name)
             {
-                boost::asio::io_service service;
+                boost::asio::io_context service;
                 boost::asio::ip::tcp::resolver resolver(service);
                 std::vector<utility::string_t> addresses;
                 boost::system::error_code ec;
                 // for now, limited to IPv4
-                const auto results = resolver.resolve({ boost::asio::ip::tcp::v4(), utility::conversions::to_utf8string(host_name), "" }, ec);
+                const auto results = resolver.resolve(boost::asio::ip::tcp::v4(), utility::conversions::to_utf8string(host_name), "", ec);
 #if BOOST_VERSION >= 106600
                 for (const auto& re : results)
                 {

@@ -344,8 +344,8 @@ namespace web
                                     server.set_listen_backlog(configuration().backlog());
                                 }
                                 websocketpp::lib::asio::ip::tcp::resolver resolver(server.get_io_service());
-                                websocketpp::lib::asio::ip::tcp::resolver::query query(host, service, {});
-                                websocketpp::lib::asio::ip::tcp::endpoint endpoint = *resolver.resolve(query);
+                                const auto results = resolver.resolve(host, service);
+                                websocketpp::lib::asio::ip::tcp::endpoint endpoint = results.begin()->endpoint();
                                 websocketpp::lib::error_code ec;
                                 server.listen(endpoint, ec);
                                 // if the error is "Underlying Transport Error" (pass_through), this might be a platform that doesn't support IPv6
@@ -357,8 +357,8 @@ namespace web
                                 {
                                     // retry, limiting ourselves to IPv4
                                     server.get_alog().write(websocketpp::log::alevel::app, "listening with IPv6 failed; retrying with IPv4 only");
-                                    websocketpp::lib::asio::ip::tcp::resolver::query query(boost::asio::ip::tcp::v4(), host, service);
-                                    websocketpp::lib::asio::ip::tcp::endpoint endpoint = *resolver.resolve(query);
+                                    const auto results = resolver.resolve(boost::asio::ip::tcp::v4(), host, service);
+                                    websocketpp::lib::asio::ip::tcp::endpoint endpoint = results.begin()->endpoint();
                                     server.listen(endpoint);
                                 }
                                 // otherwise treat any error as usual

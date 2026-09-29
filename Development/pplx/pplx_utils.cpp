@@ -67,7 +67,7 @@ namespace pplx
         // when the current <see cref="set_ambient_scheduler Function">ambient scheduler</see> has been changed from the default
         // using the shared threadpool perhaps isn't appropriate, but given the scheduler_interface, the alternative is unclear...
         auto timer = std::make_shared<steady_timer>(crossplat::threadpool::shared_instance().service());
-        timer->expires_from_now(std::chrono::duration_cast<steady_timer::duration>(std::chrono::milliseconds(milliseconds)));
+        timer->expires_after(std::chrono::duration_cast<steady_timer::duration>(std::chrono::milliseconds(milliseconds)));
         timer->async_wait([tce](const boost::system::error_code& ec)
         {
             if (ec == boost::asio::error::operation_aborted)
@@ -92,8 +92,7 @@ namespace pplx
         {
             auto registration = token.register_callback([timer]
             {
-                boost::system::error_code ignored;
-                timer->cancel(ignored);
+                timer->cancel();
             });
 
             result.then([token, registration](pplx::task<void>)

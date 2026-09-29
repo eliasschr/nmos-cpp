@@ -1,7 +1,5 @@
 [requires]
-boost/1.83.0
-cpprestsdk/2.10.19
-websocketpp/0.8.2
+boost/1.91.0
 openssl/3.5.2
 json-schema-validator/2.3.0
 nlohmann_json/3.11.3
