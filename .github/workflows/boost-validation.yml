@@ -1,0 +1,262 @@
+name: Boost Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dependency/boost-1.91-test
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boost-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WEBSOCKETPP_SHA: 182707e8b57c644a12c4b2b8c676a8b926d21b73
+  CPPRESTSDK_SHA: cd365af86d6fed5b914e64add4cab7349006c83e
+  CONAN_VERSION: 2.31.2
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - windows-2022
+
+    steps:
+      - name: Checkout nmos-cpp
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout KATE-NMOS-websocketpp
+        uses: actions/checkout@v4
+        with:
+          repository: eliasschr/KATE-NMOS-websocketpp
+          ref: ${{ env.WEBSOCKETPP_SHA }}
+          path: deps/websocketpp
+          persist-credentials: false
+
+      - name: Checkout KATE-NMOS-cpprestsdk
+        uses: actions/checkout@v4
+        with:
+          repository: eliasschr/KATE-NMOS-cpprestsdk
+          ref: ${{ env.CPPRESTSDK_SHA }}
+          path: deps/cpprestsdk
+          persist-credentials: false
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Conan
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "conan==${CONAN_VERSION}"
+          conan profile detect --force
+
+      - name: Normalize CI paths
+        shell: bash
+        run: |
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            runner_temp="$(cygpath -m "${RUNNER_TEMP}")"
+            workspace="$(cygpath -m "${GITHUB_WORKSPACE}")"
+          else
+            runner_temp="${RUNNER_TEMP}"
+            workspace="${GITHUB_WORKSPACE}"
+          fi
+
+          echo "KATE_TEMP=${runner_temp}" >> "${GITHUB_ENV}"
+          echo "KATE_WORKSPACE=${workspace}" >> "${GITHUB_ENV}"
+
+      - name: Detect host IP
+        shell: bash
+        run: |
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            host_ip="$(powershell.exe -NoProfile -Command               "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1 | ForEach-Object { Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress })"               | tr -d '\r')"
+          else
+            host_ip="$(hostname -I | awk '{print $1}')"
+          fi
+
+          if [ -z "${host_ip}" ]; then
+            echo "Could not determine host IP"
+            exit 1
+          fi
+
+          echo "HOST_IP_ADDRESS=${host_ip}" >> "${GITHUB_ENV}"
+          echo "Using host IP: ${host_ip}"
+
+      - name: Install Linux mDNS dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            libavahi-compat-libdnssd-dev \
+            libnss-mdns \
+            avahi-utils \
+            nscd
+
+          sudo sed -i 's/#*allow-interfaces=.*/allow-interfaces=eth0/g' \
+            /etc/avahi/avahi-daemon.conf
+          sudo systemctl restart avahi-daemon
+
+          echo "CTEST_EXTRA_ARGS=-E testMdnsAdvertiseAddress" >> "${GITHUB_ENV}"
+
+      - name: Install Bonjour on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -L `
+            https://download.info.apple.com/Mac_OS_X/061-8098.20100603.gthyu/BonjourPSSetup.exe `
+            -o BonjourPSSetup.exe
+
+          & 7z.exe e BonjourPSSetup.exe Bonjour64.msi -y
+          Start-Process msiexec.exe `
+            -ArgumentList '/i', 'Bonjour64.msi', '/qn', '/norestart' `
+            -Wait
+
+      - name: Verify pinned dependency revisions
+        shell: bash
+        run: |
+          websocketpp_actual="$(git -C deps/websocketpp rev-parse HEAD)"
+          cpprestsdk_actual="$(git -C deps/cpprestsdk rev-parse HEAD)"
+
+          echo "WebSocket++ expected: ${WEBSOCKETPP_SHA}"
+          echo "WebSocket++ actual:   ${websocketpp_actual}"
+          echo
+          echo "cpprestsdk expected:  ${CPPRESTSDK_SHA}"
+          echo "cpprestsdk actual:    ${cpprestsdk_actual}"
+
+          test "${websocketpp_actual}" = "${WEBSOCKETPP_SHA}"
+          test "${cpprestsdk_actual}" = "${CPPRESTSDK_SHA}"
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          cmake --version
+          ninja --version
+          conan --version
+          "${CXX:-c++}" --version || true
+
+      - name: Prepare controlled Conan dependencies
+        shell: bash
+        run: |
+          mkdir -p "${KATE_TEMP}/kate-conan"
+          mkdir -p "${KATE_TEMP}/empty-pkgconfig"
+
+          cat > "${KATE_TEMP}/kate-conan/conanfile.txt" <<'EOF'
+          [requires]
+          boost/1.91.0
+          openssl/3.5.2
+          zlib/1.3.1
+
+          [generators]
+          CMakeDeps
+          EOF
+
+          conan install \
+            "${KATE_TEMP}/kate-conan/conanfile.txt" \
+            --output-folder="${KATE_TEMP}/kate-conan" \
+            --build=missing \
+            -s:h build_type=Release \
+            -s:h compiler.cppstd=17
+
+          echo "PKG_CONFIG_PATH=${KATE_TEMP}/empty-pkgconfig" >> "${GITHUB_ENV}"
+          echo "PKG_CONFIG_LIBDIR=${KATE_TEMP}/empty-pkgconfig" >> "${GITHUB_ENV}"
+          echo "CPPREST_PREFIX=${KATE_TEMP}/kate-cpprestsdk" >> "${GITHUB_ENV}"
+
+      - name: Configure KATE-NMOS-cpprestsdk
+        shell: bash
+        run: |
+          cmake \
+            -S deps/cpprestsdk/Release \
+            -B "${KATE_TEMP}/cpprest-build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_CXX_EXTENSIONS=OFF \
+            -DCMAKE_INSTALL_PREFIX="${CPPREST_PREFIX}" \
+            -DCMAKE_PREFIX_PATH="${KATE_TEMP}/kate-conan" \
+            -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON \
+            -DWEBSOCKETPP_INCLUDE_DIR="${KATE_WORKSPACE}/deps/websocketpp" \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_SAMPLES=OFF \
+            -DWERROR=ON
+
+      - name: Build and install KATE-NMOS-cpprestsdk
+        shell: bash
+        run: |
+          cmake \
+            --build "${KATE_TEMP}/cpprest-build" \
+            --parallel
+
+          cmake \
+            --install "${KATE_TEMP}/cpprest-build" \
+            --config Release
+
+      - name: Add cpprestsdk runtime path
+        shell: bash
+        run: |
+          echo "${CPPREST_PREFIX}/bin" >> "${GITHUB_PATH}"
+
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            echo "LD_LIBRARY_PATH=${CPPREST_PREFIX}/lib:${LD_LIBRARY_PATH:-}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Configure nmos-cpp
+        shell: bash
+        run: |
+          cmake \
+            -S Development \
+            -B "${KATE_TEMP}/nmos-build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_CXX_EXTENSIONS=OFF \
+            -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES=third_party/cmake/conan_provider.cmake \
+            -DCONAN_INSTALL_ARGS="--build=missing" \
+            -Dcpprestsdk_DIR="${CPPREST_PREFIX}/lib/cmake/cpprestsdk" \
+            -DWEBSOCKETPP_INCLUDE_DIR="${KATE_WORKSPACE}/deps/websocketpp"
+
+      - name: Build nmos-cpp
+        shell: bash
+        run: |
+          cmake \
+            --build "${KATE_TEMP}/nmos-build" \
+            --parallel
+
+      - name: Run nmos-cpp tests
+        shell: bash
+        run: |
+          ctest \
+            --test-dir "${KATE_TEMP}/nmos-build" \
+            --output-on-failure \
+            ${CTEST_EXTRA_ARGS:-}
+
+      - name: Run known Linux mDNS test separately
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          ctest \
+            --test-dir "${KATE_TEMP}/nmos-build" \
+            --output-on-failure \
+            -R testMdnsAdvertiseAddress
