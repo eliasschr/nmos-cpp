@@ -15,7 +15,7 @@ concurrency:
 
 env:
   WEBSOCKETPP_SHA: 182707e8b57c644a12c4b2b8c676a8b926d21b73
-  CPPRESTSDK_SHA: cd365af86d6fed5b914e64add4cab7349006c83e
+  CPPRESTSDK_SHA: f739497f19141318a997953f0f5b1a4eff224212
   CONAN_VERSION: 2.31.2
 
 jobs:
@@ -58,10 +58,32 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Preserve act Node path
+        shell: bash
+        run: |
+          if [ "${ACT:-}" = "true" ]; then
+            node_path="$(command -v node)"
+            echo "act Node path: ${node_path}"
+            echo "ACT_NODE_DIR=$(dirname "${node_path}")" >> "${GITHUB_ENV}"
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+
+      - name: Restore act Node path
+        shell: bash
+        run: |
+          if [ "${ACT:-}" = "true" ]; then
+            echo "${ACT_NODE_DIR}" >> "${GITHUB_PATH}"
+            export PATH="${ACT_NODE_DIR}:${PATH}"
+            echo "Restored Node:"
+            node --version
+          fi
+
+      - name: Set up CMake and Ninja
+        uses: lukka/get-cmake@v3.28.3
 
       - name: Install Conan
         shell: bash
@@ -112,11 +134,13 @@ jobs:
             avahi-utils \
             nscd
 
-          sudo sed -i 's/#*allow-interfaces=.*/allow-interfaces=eth0/g' \
-            /etc/avahi/avahi-daemon.conf
-          sudo systemctl restart avahi-daemon
-
-          echo "CTEST_EXTRA_ARGS=-E testMdnsAdvertiseAddress" >> "${GITHUB_ENV}"
+          if [ "${ACT:-}" != "true" ]; then
+            sudo sed -i 's/#*allow-interfaces=.*/allow-interfaces=eth0/g' \
+              /etc/avahi/avahi-daemon.conf
+            sudo systemctl restart avahi-daemon
+          else
+            echo "act detected: skipping Avahi daemon reconfiguration"
+          fi
 
       - name: Install Bonjour on Windows
         if: runner.os == 'Windows'
@@ -177,9 +201,11 @@ jobs:
             -s:h build_type=Release \
             -s:h compiler.cppstd=17
 
-          echo "PKG_CONFIG_PATH=${KATE_TEMP}/empty-pkgconfig" >> "${GITHUB_ENV}"
-          echo "PKG_CONFIG_LIBDIR=${KATE_TEMP}/empty-pkgconfig" >> "${GITHUB_ENV}"
-          echo "CPPREST_PREFIX=${KATE_TEMP}/kate-cpprestsdk" >> "${GITHUB_ENV}"
+          {
+            echo "PKG_CONFIG_PATH=${KATE_TEMP}/empty-pkgconfig"
+            echo "PKG_CONFIG_LIBDIR=${KATE_TEMP}/empty-pkgconfig"
+            echo "CPPREST_PREFIX=${KATE_TEMP}/kate-cpprestsdk"
+          } >> "${GITHUB_ENV}"
 
       - name: Configure KATE-NMOS-cpprestsdk
         shell: bash
@@ -194,6 +220,7 @@ jobs:
             -DCMAKE_CXX_EXTENSIONS=OFF \
             -DCMAKE_INSTALL_PREFIX="${CPPREST_PREFIX}" \
             -DCMAKE_PREFIX_PATH="${KATE_TEMP}/kate-conan" \
+            -DCMAKE_MODULE_PATH="${KATE_TEMP}/kate-conan" \
             -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON \
             -DWEBSOCKETPP_INCLUDE_DIR="${KATE_WORKSPACE}/deps/websocketpp" \
             -DBUILD_TESTS=OFF \
@@ -246,10 +273,16 @@ jobs:
       - name: Run nmos-cpp tests
         shell: bash
         run: |
-          ctest \
-            --test-dir "${KATE_TEMP}/nmos-build" \
-            --output-on-failure \
-            ${CTEST_EXTRA_ARGS:-}
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            ctest \
+              --test-dir "${KATE_TEMP}/nmos-build" \
+              --output-on-failure \
+              -E testMdnsAdvertiseAddress
+          else
+            ctest \
+              --test-dir "${KATE_TEMP}/nmos-build" \
+              --output-on-failure
+          fi
 
       - name: Run known Linux mDNS test separately
         if: runner.os == 'Linux'
