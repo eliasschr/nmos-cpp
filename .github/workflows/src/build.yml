@@ -1,7 +1,3 @@
-- name: setup developer command prompt for Microsoft Visual C++
-  if: runner.os == 'Windows'
-  uses: ilammy/msvc-dev-cmd@v1
-
 - name: build
   uses: lukka/run-cmake@v3.4
   with:

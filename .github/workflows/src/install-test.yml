@@ -15,7 +15,7 @@
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_FIND_PACKAGE_PREFER_CONFIG="1"
         -DCMAKE_MODULE_PATH="${{ env.CMAKE_WORKSPACE }}/build/conan"
-        -DCMAKE_PREFIX_PATH="${{ env.CMAKE_WORKSPACE }}/install"
+        -DCMAKE_PREFIX_PATH="${{ env.CMAKE_WORKSPACE }}/install;${{ env.KATE_CPPREST_PREFIX }};${{ env.CMAKE_WORKSPACE }}/build/conan"
         -DCMAKE_INSTALL_PREFIX="${{ env.CMAKE_WORKSPACE }}/build/conan"
         ${{ env.CMAKE_COMPILER_ARGS }}'
 

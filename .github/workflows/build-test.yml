@@ -10,6 +10,9 @@ on: [pull_request, push]
 env:
   SECRET_GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
   SECRET_RESULTS_SHEET_ID: ${{ secrets.RESULTS_SHEET_ID }}
+  WEBSOCKETPP_SHA: 4305cf8af8e9fa61b95c6008651eed73e835c67b
+  CPPRESTSDK_SHA: f739497f19141318a997953f0f5b1a4eff224212
+  CONAN_VERSION: 2.31.2
 jobs:
   build_and_test:
     name: '${{ matrix.os }}: build and test (install mdns: ${{ matrix.install_mdns }}, use conan: ${{ matrix.use_conan }}, force cpprest asio: ${{ matrix.force_cpprest_asio }}, dns-sd mode: ${{ matrix.dns_sd_mode}}, enable_authorization: ${{ matrix.enable_authorization }})'
@@ -96,10 +99,15 @@ jobs:
         openssl base64 -d -A -in secret.b64 -out gdrive/credentials.json
         echo "GDRIVE_CREDENTIALS=`pwd`/gdrive/credentials.json" >> $GITHUB_ENV
 
+    - name: setup developer command prompt for Microsoft Visual C++
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+
     - name: install conan
       if: matrix.use_conan == true
       run: |
-        pip install conan~=2.20
+        python -m pip install "conan==${{ env.CONAN_VERSION }}"
+        conan profile detect --force
 
     - name: 'ubuntu-14.04: install cmake'
       if: matrix.os == 'ubuntu-14.04'
@@ -116,6 +124,37 @@ jobs:
         # translate GITHUB_WORKSPACE into a bash path from a windows path
         workspace_dir=`pwd`
         echo "GITHUB_WORKSPACE_BASH=${workspace_dir}" >> $GITHUB_ENV
+
+    - name: checkout KATE-NMOS-websocketpp
+      uses: actions/checkout@v4
+      with:
+        repository: eliasschr/KATE-NMOS-websocketpp
+        ref: ${{ env.WEBSOCKETPP_SHA }}
+        path: deps/websocketpp
+        persist-credentials: false
+
+    - name: checkout KATE-NMOS-cpprestsdk
+      uses: actions/checkout@v4
+      with:
+        repository: eliasschr/KATE-NMOS-cpprestsdk
+        ref: ${{ env.CPPRESTSDK_SHA }}
+        path: deps/cpprestsdk
+        persist-credentials: false
+
+    - name: verify pinned KATE dependency revisions
+      shell: bash
+      run: |
+        websocketpp_actual="$(git -C deps/websocketpp rev-parse HEAD)"
+        cpprestsdk_actual="$(git -C deps/cpprestsdk rev-parse HEAD)"
+
+        echo "WebSocket++ expected: ${WEBSOCKETPP_SHA}"
+        echo "WebSocket++ actual:   ${websocketpp_actual}"
+        echo
+        echo "cpprestsdk expected:  ${CPPRESTSDK_SHA}"
+        echo "cpprestsdk actual:    ${cpprestsdk_actual}"
+
+        test "${websocketpp_actual}" = "${WEBSOCKETPP_SHA}"
+        test "${cpprestsdk_actual}" = "${CPPRESTSDK_SHA}"
 
     - name: windows setup
       if: runner.os == 'Windows'
@@ -301,11 +340,114 @@ jobs:
         # force dependency on avahi
         echo "CMAKE_EXTRA_ARGS=${{ env.CMAKE_EXTRA_ARGS }} -DNMOS_CPP_USE_AVAHI:BOOL=\"1\"" >> $GITHUB_ENV
 
-    - name: force cpprest asio
+    - name: force KATE cpprestsdk ASIO
       if: matrix.force_cpprest_asio == true && matrix.use_conan == true
       shell: bash
       run: |
-        echo "CONAN_INSTALL_EXTRA_ARGS=--options\;cpprestsdk/*:http_client_impl=asio\;--options\;cpprestsdk/*:http_listener_impl=asio" >> $GITHUB_ENV
+        echo "KATE_CPPREST_EXTRA_ARGS=-DCPPREST_HTTP_CLIENT_IMPL=asio -DCPPREST_HTTP_LISTENER_IMPL=asio" >> $GITHUB_ENV
+
+    - name: prepare controlled KATE Conan dependencies
+      if: matrix.use_conan == true
+      shell: bash
+      run: |
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          runner_workspace="$(cygpath -m "${RUNNER_WORKSPACE}")"
+          workspace="$(cygpath -m "${GITHUB_WORKSPACE}")"
+        else
+          runner_workspace="${RUNNER_WORKSPACE}"
+          workspace="${GITHUB_WORKSPACE}"
+        fi
+
+        kate_conan="${runner_workspace}/kate-conan"
+        empty_pkgconfig="${runner_workspace}/empty-pkgconfig"
+        mkdir -p "${kate_conan}" "${empty_pkgconfig}"
+
+        cat > "${kate_conan}/conanfile.txt" <<'EOF'
+        [requires]
+        boost/1.91.0
+        openssl/3.5.2
+        zlib/1.3.1
+
+        [generators]
+        CMakeDeps
+        EOF
+
+        conan install "${kate_conan}/conanfile.txt" \
+          --output-folder="${kate_conan}" \
+          --build=missing \
+          -s:h build_type=Release \
+          -s:h compiler.cppstd=17
+
+        {
+          echo "KATE_CONAN=${kate_conan}"
+          echo "KATE_WORKSPACE=${workspace}"
+          echo "KATE_BUILD_ROOT=${runner_workspace}"
+          echo "KATE_CPPREST_PREFIX=${runner_workspace}/kate-cpprestsdk"
+          echo "PKG_CONFIG_PATH=${empty_pkgconfig}"
+          echo "PKG_CONFIG_LIBDIR=${empty_pkgconfig}"
+        } >> $GITHUB_ENV
+
+    - name: configure KATE-NMOS-cpprestsdk
+      if: matrix.use_conan == true
+      shell: bash
+      run: |
+        cmake \
+          -S "${KATE_WORKSPACE}/deps/cpprestsdk/Release" \
+          -B "${KATE_BUILD_ROOT}/kate-cpprest-build" \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_STANDARD=17 \
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+          -DCMAKE_CXX_EXTENSIONS=OFF \
+          -DCMAKE_INSTALL_PREFIX="${KATE_CPPREST_PREFIX}" \
+          -DCMAKE_PREFIX_PATH="${KATE_CONAN}" \
+          -DCMAKE_MODULE_PATH="${KATE_CONAN}" \
+          -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON \
+          -DWEBSOCKETPP_INCLUDE_DIR="${KATE_WORKSPACE}/deps/websocketpp" \
+          -DBUILD_TESTS=OFF \
+          -DBUILD_SAMPLES=OFF \
+          -DWERROR=ON \
+          ${KATE_CPPREST_EXTRA_ARGS}
+
+    - name: verify KATE-NMOS-cpprestsdk HTTP backends
+      if: matrix.use_conan == true
+      shell: bash
+      run: |
+        cache="${KATE_BUILD_ROOT}/kate-cpprest-build/CMakeCache.txt"
+        client="$(sed -n 's/^CPPREST_HTTP_CLIENT_IMPL:[^=]*=//p' "${cache}")"
+        listener="$(sed -n 's/^CPPREST_HTTP_LISTENER_IMPL:[^=]*=//p' "${cache}")"
+
+        echo "CPPREST_HTTP_CLIENT_IMPL=${client}"
+        echo "CPPREST_HTTP_LISTENER_IMPL=${listener}"
+
+        if [ "${RUNNER_OS}" = "Windows" ] && [ "${{ matrix.force_cpprest_asio }}" = "false" ]; then
+          expected_client=winhttp
+          expected_listener=httpsys
+        else
+          expected_client=asio
+          expected_listener=asio
+        fi
+
+        if [ "${client}" != "${expected_client}" ] || [ "${listener}" != "${expected_listener}" ]; then
+          echo "Unexpected cpprestsdk HTTP backends: expected client=${expected_client}, listener=${expected_listener}; got client=${client:-<missing>}, listener=${listener:-<missing>}." >&2
+          exit 1
+        fi
+
+    - name: build and install KATE-NMOS-cpprestsdk
+      if: matrix.use_conan == true
+      shell: bash
+      run: |
+        cmake --build "${KATE_BUILD_ROOT}/kate-cpprest-build" --parallel
+        cmake --install "${KATE_BUILD_ROOT}/kate-cpprest-build" --config Release
+
+    - name: add KATE cpprestsdk runtime path
+      if: matrix.use_conan == true
+      shell: bash
+      run: |
+        echo "${KATE_CPPREST_PREFIX}/bin" >> $GITHUB_PATH
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          echo "LD_LIBRARY_PATH=${KATE_CPPREST_PREFIX}/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+        fi
 
     - name: enable conan
       if: matrix.use_conan == true
@@ -313,13 +455,11 @@ jobs:
       run: |
         echo "CMAKE_EXTRA_ARGS=${{ env.CMAKE_EXTRA_ARGS }}" \
           "-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES:STRING=\"third_party/cmake/conan_provider.cmake\"" \
-          "-DCONAN_INSTALL_ARGS:STRING=\"--build=missing\;${{ env.CONAN_INSTALL_EXTRA_ARGS }}\;--lockfile-out=conan.lock\"" \
+          "-DCONAN_INSTALL_ARGS:STRING=\"--build=missing\;--lockfile-out=conan.lock\"" \
+          "-Dcpprestsdk_DIR:PATH=\"${KATE_CPPREST_PREFIX}/lib/cmake/cpprestsdk\"" \
+          "-DWEBSOCKETPP_INCLUDE_DIR:PATH=\"${KATE_WORKSPACE}/deps/websocketpp\"" \
           >> $GITHUB_ENV
         cat $GITHUB_ENV
-
-    - name: setup developer command prompt for Microsoft Visual C++
-      if: runner.os == 'Windows'
-      uses: ilammy/msvc-dev-cmd@v1
 
     - name: build
       uses: lukka/run-cmake@v3.4
@@ -371,7 +511,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
             -DCMAKE_FIND_PACKAGE_PREFER_CONFIG="1"
             -DCMAKE_MODULE_PATH="${{ env.CMAKE_WORKSPACE }}/build/conan"
-            -DCMAKE_PREFIX_PATH="${{ env.CMAKE_WORKSPACE }}/install"
+            -DCMAKE_PREFIX_PATH="${{ env.CMAKE_WORKSPACE }}/install;${{ env.KATE_CPPREST_PREFIX }};${{ env.CMAKE_WORKSPACE }}/build/conan"
             -DCMAKE_INSTALL_PREFIX="${{ env.CMAKE_WORKSPACE }}/build/conan"
             ${{ env.CMAKE_COMPILER_ARGS }}'
 

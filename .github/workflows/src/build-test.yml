@@ -10,6 +10,9 @@ on: [pull_request, push]
 env:
   SECRET_GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
   SECRET_RESULTS_SHEET_ID: ${{ secrets.RESULTS_SHEET_ID }}
+  WEBSOCKETPP_SHA: 4305cf8af8e9fa61b95c6008651eed73e835c67b
+  CPPRESTSDK_SHA: f739497f19141318a997953f0f5b1a4eff224212
+  CONAN_VERSION: 2.31.2
 jobs:
   build_and_test:
     name: '${{ matrix.os }}: build and test (install mdns: ${{ matrix.install_mdns }}, use conan: ${{ matrix.use_conan }}, force cpprest asio: ${{ matrix.force_cpprest_asio }}, dns-sd mode: ${{ matrix.dns_sd_mode}}, enable_authorization: ${{ matrix.enable_authorization }})'
