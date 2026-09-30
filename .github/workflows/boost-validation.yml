@@ -110,7 +110,7 @@ jobs:
         shell: bash
         run: |
           if [ "${RUNNER_OS}" = "Windows" ]; then
-            host_ip="$(powershell.exe -NoProfile -Command               "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1 | ForEach-Object { Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress })"               | tr -d '\r')"
+            host_ip="$(powershell.exe -NoProfile -Command "\$route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1; Get-NetIPAddress -InterfaceIndex \$route.InterfaceIndex -AddressFamily IPv4 | Where-Object { \$_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress" | tr -d '\r')"
           else
             host_ip="$(hostname -I | awk '{print $1}')"
           fi
