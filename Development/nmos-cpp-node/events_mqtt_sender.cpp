@@ -25,18 +25,37 @@ namespace impl
 
     struct events_mqtt_sender::impl
     {
-        using client_type = boost::mqtt5::mqtt_client<boost::asio::ip::tcp::socket>;
+        struct connection_logger
+        {
+            impl* owner;
+
+            void at_connack(boost::mqtt5::reason_code reason, bool, const boost::mqtt5::connack_props&);
+            void at_disconnect(boost::mqtt5::reason_code, const boost::mqtt5::disconnect_props&);
+            void at_transport_error(boost::mqtt5::error_code);
+        };
+
+        using client_type = boost::mqtt5::mqtt_client<boost::asio::ip::tcp::socket, std::monostate, connection_logger>;
 
         boost::asio::io_context io;
-        client_type client{ io };
-        boost::asio::steady_timer shutdown_timer{ io };
+        client_type client;
+        boost::asio::steady_timer shutdown_timer;
         std::thread thread;
         std::atomic<bool> stopping{ false };
+        // The following fields are accessed only on io's executor.
+        bool connected{ false };
+        bool disconnect_started{ false };
         std::string broker_topic;
         std::string status_topic;
+        std::string latest_state;
 
         impl(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
+            : client(io, {}, connection_logger{ this })
+            , shutdown_timer(io)
         {
+            // The event thread's JSON value cannot outlive this call, so retain
+            // its serialized representation before starting MQTT connection handling.
+            latest_state = utf8(state.serialize());
+
             const auto& params = transport_params.at(0);
             const auto broker_host = utf8(nmos::fields::destination_host(params).as_string());
             const auto broker_port = static_cast<uint16_t>(nmos::fields::destination_port(params).as_integer());
@@ -47,12 +66,6 @@ namespace impl
             client.brokers(broker_host, broker_port);
             client.will(boost::mqtt5::will{ status_topic, connection_status(false), boost::mqtt5::qos_e::exactly_once, boost::mqtt5::retain_e::yes });
             client.async_run([](boost::mqtt5::error_code) {});
-
-            const boost::mqtt5::publish_props props{};
-            client.async_publish<boost::mqtt5::qos_e::exactly_once>(status_topic, connection_status(true), boost::mqtt5::retain_e::yes, props,
-                [](boost::mqtt5::error_code, auto, auto) {});
-            client.async_publish<boost::mqtt5::qos_e::exactly_once>(broker_topic, utf8(state.serialize()), boost::mqtt5::retain_e::yes, props,
-                [](boost::mqtt5::error_code, auto, auto) {});
 
             thread = std::thread([this] { io.run(); });
         }
@@ -68,20 +81,28 @@ namespace impl
             if (stopping.exchange(true)) return;
             boost::asio::post(io, [this]
             {
-                const boost::mqtt5::publish_props props{};
-                client.async_publish<boost::mqtt5::qos_e::exactly_once>(status_topic, connection_status(false), boost::mqtt5::retain_e::yes, props,
-                    [this](boost::mqtt5::error_code, auto, auto)
-                    {
-                        shutdown_timer.cancel();
-                        client.async_disconnect([](boost::mqtt5::error_code) {});
-                    });
+                if (!connected)
+                {
+                    // Do not let Boost.MQTT5 queue a graceful-shutdown status
+                    // while it is reconnecting to an unavailable broker.
+                    begin_disconnect();
+                    return;
+                }
+
+                connected = false;
+                publish_retained(status_topic, connection_status(false), [this]
+                {
+                    shutdown_timer.cancel();
+                    begin_disconnect();
+                });
+
                 // Permit the retained graceful-shutdown status to complete before
                 // starting disconnect. async_disconnect may still take up to about
                 // five seconds when the broker is unavailable.
                 shutdown_timer.expires_after(std::chrono::seconds(1));
                 shutdown_timer.async_wait([this](boost::mqtt5::error_code error)
                 {
-                    if (!error) client.async_disconnect([](boost::mqtt5::error_code) {});
+                    if (!error) begin_disconnect();
                 });
             });
         }
@@ -97,12 +118,68 @@ namespace impl
             {
                 if (stopping.load()) return;
 
-                const boost::mqtt5::publish_props props{};
-                client.async_publish<boost::mqtt5::qos_e::exactly_once>(broker_topic, serialized_state, boost::mqtt5::retain_e::yes, props,
-                    [](boost::mqtt5::error_code, auto, auto) {});
+                latest_state = std::move(serialized_state);
+                if (!connected) return;
+
+                publish_retained(broker_topic, latest_state, [] {});
             });
         }
+
+        void on_connack(boost::mqtt5::reason_code reason)
+        {
+            // A successful MQTT v5 CONNACK has reason code 0. Failed CONNACKs
+            // are followed by Boost.MQTT5's built-in reconnect handling.
+            if (stopping.load() || reason.value() != boost::mqtt5::reason_codes::success.value()) return;
+
+            connected = true;
+            // Preserve the externally visible ordering on every connection.
+            publish_retained(status_topic, connection_status(true), [] {});
+            publish_retained(broker_topic, latest_state, [] {});
+        }
+
+        void on_disconnect()
+        {
+            connected = false;
+        }
+
+        void on_transport_error()
+        {
+            connected = false;
+        }
+
+        template <typename Handler>
+        void publish_retained(const std::string& topic, const std::string& payload, Handler&& handler)
+        {
+            const boost::mqtt5::publish_props props{};
+            client.async_publish<boost::mqtt5::qos_e::exactly_once>(topic, payload, boost::mqtt5::retain_e::yes, props,
+                [handler = std::forward<Handler>(handler)](boost::mqtt5::error_code, auto, auto) mutable
+                {
+                    handler();
+                });
+        }
+
+        void begin_disconnect()
+        {
+            if (disconnect_started) return;
+            disconnect_started = true;
+            client.async_disconnect([](boost::mqtt5::error_code) {});
+        }
     };
+
+    void events_mqtt_sender::impl::connection_logger::at_connack(boost::mqtt5::reason_code reason, bool, const boost::mqtt5::connack_props&)
+    {
+        owner->on_connack(reason);
+    }
+
+    void events_mqtt_sender::impl::connection_logger::at_disconnect(boost::mqtt5::reason_code, const boost::mqtt5::disconnect_props&)
+    {
+        owner->on_disconnect();
+    }
+
+    void events_mqtt_sender::impl::connection_logger::at_transport_error(boost::mqtt5::error_code)
+    {
+        owner->on_transport_error();
+    }
 
     events_mqtt_sender::events_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
         : impl_(new impl(sender_id, transport_params, state))
