@@ -17,6 +17,7 @@ namespace impl
         events_mqtt_sender(const events_mqtt_sender&) = delete;
         events_mqtt_sender& operator=(const events_mqtt_sender&) = delete;
 
+        void publish_state(const web::json::value& state);
         void stop();
 
     private:

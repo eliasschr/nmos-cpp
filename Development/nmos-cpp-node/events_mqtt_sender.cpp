@@ -32,6 +32,7 @@ namespace impl
         boost::asio::steady_timer shutdown_timer{ io };
         std::thread thread;
         std::atomic<bool> stopping{ false };
+        std::string broker_topic;
         std::string status_topic;
 
         impl(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
@@ -39,7 +40,7 @@ namespace impl
             const auto& params = transport_params.at(0);
             const auto broker_host = utf8(nmos::fields::destination_host(params).as_string());
             const auto broker_port = static_cast<uint16_t>(nmos::fields::destination_port(params).as_integer());
-            const auto broker_topic = utf8(nmos::fields::broker_topic(params).as_string());
+            broker_topic = utf8(nmos::fields::broker_topic(params).as_string());
             status_topic = utf8(nmos::fields::connection_status_broker_topic(params).as_string());
 
             client.credentials(utf8(sender_id));
@@ -84,6 +85,23 @@ namespace impl
                 });
             });
         }
+
+        void publish_state(const web::json::value& state)
+        {
+            // The event thread's JSON value cannot outlive this call, so retain
+            // its serialized representation before posting to the MQTT context.
+            auto serialized_state = utf8(state.serialize());
+            if (stopping.load()) return;
+
+            boost::asio::post(io, [this, serialized_state = std::move(serialized_state)]
+            {
+                if (stopping.load()) return;
+
+                const boost::mqtt5::publish_props props{};
+                client.async_publish<boost::mqtt5::qos_e::exactly_once>(broker_topic, serialized_state, boost::mqtt5::retain_e::yes, props,
+                    [](boost::mqtt5::error_code, auto, auto) {});
+            });
+        }
     };
 
     events_mqtt_sender::events_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
@@ -91,6 +109,11 @@ namespace impl
     {}
 
     events_mqtt_sender::~events_mqtt_sender() = default;
+
+    void events_mqtt_sender::publish_state(const web::json::value& state)
+    {
+        impl_->publish_state(state);
+    }
 
     void events_mqtt_sender::stop()
     {

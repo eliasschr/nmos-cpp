@@ -98,7 +98,7 @@ namespace impl
         const web::json::field_as_value_or receivers{ U("receivers"), {} };
         // MQTT is opt-in per existing IS-07 sender port. Omitting it preserves
         // the historical all-WebSocket sender behaviour.
-        const web::json::field_as_value_or mqtt_senders{ U("mqtt_senders"), {} };
+        const web::json::field_as_value_or mqtt_senders{ U("mqtt_senders"), web::json::value::array() };
         const web::json::field_as_string_or mqtt_broker_host{ U("mqtt_broker_host"), U("127.0.0.1") };
         const web::json::field_as_integer_or mqtt_broker_port{ U("mqtt_broker_port"), 1883 };
 
@@ -194,6 +194,7 @@ namespace impl
     std::vector<port> parse_ports(const web::json::value& value);
     void activate_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state);
     void deactivate_mqtt_sender(const nmos::id& sender_id);
+    void publish_mqtt_state(const nmos::id& sender_id, const web::json::value& state);
 
     const std::vector<nmos::channel> channels_repeat{
         { U("Left Channel"), nmos::channel_symbols::L },
@@ -1744,6 +1745,11 @@ void node_implementation_run(nmos::node_model& model, nmos::experimental::contro
     const auto sender_ports = impl::parse_ports(impl::fields::senders(model.settings));
     const auto rtp_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_rtp_port));
     const auto ws_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_ws_port));
+    const auto configured_mqtt_sender_ports = impl::parse_ports(impl::fields::mqtt_senders(model.settings));
+    const auto mqtt_sender_ports = boost::copy_range<std::vector<impl::port>>(ws_sender_ports | boost::adaptors::filtered([&](const impl::port& port)
+    {
+        return configured_mqtt_sender_ports.end() != boost::range::find(configured_mqtt_sender_ports, port);
+    }));
     const auto receiver_ports = impl::parse_ports(impl::fields::receivers(model.settings));
     const auto rtp_receiver_ports = boost::copy_range<std::vector<impl::port>>(receiver_ports | boost::adaptors::filtered(impl::is_rtp_port));
     const auto simulate_status_monitor_activity = impl::fields::simulate_status_monitor_activity(model.settings);
@@ -1773,10 +1779,10 @@ void node_implementation_run(nmos::node_model& model, nmos::experimental::contro
     auto cancellation_source = pplx::cancellation_token_source();
 
     auto token = cancellation_source.get_token();
-    auto events = pplx::do_while([&model, seed_id, how_many, simulate_status_monitor_activity, ws_sender_ports, rtp_receiver_ports, rtp_sender_ports, get_control_protocol_property, set_receiver_monitor_link_status, set_receiver_monitor_connection_status, set_receiver_monitor_external_synchronization_status, set_receiver_monitor_stream_status, set_receiver_monitor_synchronization_source_id, set_sender_monitor_link_status, set_sender_monitor_transmission_status, set_sender_monitor_external_synchronization_status, set_sender_monitor_essence_status, set_sender_monitor_synchronization_source_id, set_control_protocol_property, events_engine, &gate, token]
+    auto events = pplx::do_while([&model, seed_id, how_many, simulate_status_monitor_activity, ws_sender_ports, mqtt_sender_ports, rtp_receiver_ports, rtp_sender_ports, get_control_protocol_property, set_receiver_monitor_link_status, set_receiver_monitor_connection_status, set_receiver_monitor_external_synchronization_status, set_receiver_monitor_stream_status, set_receiver_monitor_synchronization_source_id, set_sender_monitor_link_status, set_sender_monitor_transmission_status, set_sender_monitor_external_synchronization_status, set_sender_monitor_essence_status, set_sender_monitor_synchronization_source_id, set_control_protocol_property, events_engine, &gate, token]
     {
         const auto event_interval = std::uniform_real_distribution<>(0.5, 5.0)(*events_engine);
-        return pplx::complete_after(std::chrono::milliseconds(std::chrono::milliseconds::rep(1000 * event_interval)), token).then([&model, seed_id, how_many, simulate_status_monitor_activity, ws_sender_ports, rtp_receiver_ports, rtp_sender_ports, get_control_protocol_property, set_receiver_monitor_link_status, set_receiver_monitor_connection_status, set_receiver_monitor_external_synchronization_status, set_receiver_monitor_stream_status, set_receiver_monitor_synchronization_source_id, set_sender_monitor_link_status, set_sender_monitor_transmission_status, set_sender_monitor_external_synchronization_status, set_sender_monitor_essence_status, set_sender_monitor_synchronization_source_id, set_control_protocol_property, events_engine, &gate]
+        return pplx::complete_after(std::chrono::milliseconds(std::chrono::milliseconds::rep(1000 * event_interval)), token).then([&model, seed_id, how_many, simulate_status_monitor_activity, ws_sender_ports, mqtt_sender_ports, rtp_receiver_ports, rtp_sender_ports, get_control_protocol_property, set_receiver_monitor_link_status, set_receiver_monitor_connection_status, set_receiver_monitor_external_synchronization_status, set_receiver_monitor_stream_status, set_receiver_monitor_synchronization_source_id, set_sender_monitor_link_status, set_sender_monitor_transmission_status, set_sender_monitor_external_synchronization_status, set_sender_monitor_essence_status, set_sender_monitor_synchronization_source_id, set_control_protocol_property, events_engine, &gate]
         {
             auto lock = model.write_lock();
 
@@ -1790,29 +1796,35 @@ void node_implementation_run(nmos::node_model& model, nmos::experimental::contro
                 {
                     const auto source_id = impl::make_id(seed_id, nmos::types::source, port, index);
                     const auto flow_id = impl::make_id(seed_id, nmos::types::flow, port, index);
+                    const auto sender_id = impl::make_id(seed_id, nmos::types::sender, port, index);
 
                     modify_resource(model.events_resources, source_id, [&](nmos::resource& resource)
                     {
+                        web::json::value state;
                         if (impl::ports::temperature == port)
                         {
-                            nmos::fields::endpoint_state(resource.data) = nmos::make_events_number_state({ source_id, flow_id }, temp, impl::temperature_Celsius);
+                            state = nmos::make_events_number_state({ source_id, flow_id }, temp, impl::temperature_Celsius);
                         }
                         else if (impl::ports::burn == port)
                         {
-                            nmos::fields::endpoint_state(resource.data) = nmos::make_events_boolean_state({ source_id, flow_id }, temp.scaled_value() > 20.0);
+                            state = nmos::make_events_boolean_state({ source_id, flow_id }, temp.scaled_value() > 20.0);
                         }
                         else if (impl::ports::nonsense == port)
                         {
                             const auto nonsenses = { U("foo"), U("bar"), U("baz"), U("qux"), U("quux"), U("quuux") };
                             const auto& nonsense = *(nonsenses.begin() + (std::min)(std::geometric_distribution<size_t>()(*events_engine), nonsenses.size() - 1));
-                            nmos::fields::endpoint_state(resource.data) = nmos::make_events_string_state({ source_id, flow_id }, nonsense);
+                            state = nmos::make_events_string_state({ source_id, flow_id }, nonsense);
                         }
                         else if (impl::ports::catcall == port)
                         {
                             const auto catcalls = { 1, 2, 4, 8 };
                             const auto& catcall = *(catcalls.begin() + (std::min)(std::geometric_distribution<size_t>()(*events_engine), catcalls.size() - 1));
-                            nmos::fields::endpoint_state(resource.data) = nmos::make_events_number_state({ source_id, flow_id }, catcall, impl::catcall);
+                            state = nmos::make_events_number_state({ source_id, flow_id }, catcall, impl::catcall);
                         }
+
+                        nmos::fields::endpoint_state(resource.data) = state;
+                        if (mqtt_sender_ports.end() != boost::range::find(mqtt_sender_ports, port))
+                            impl::publish_mqtt_state(sender_id, state);
                     });
                 }
             }
@@ -2586,7 +2598,7 @@ namespace impl
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                requests_.push_back({ true, sender_id, transport_params, state });
+                requests_.push_back({ request_operation::activate, sender_id, transport_params, state });
             }
             condition_.notify_one();
         }
@@ -2595,15 +2607,26 @@ namespace impl
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                requests_.push_back({ false, sender_id, {}, {} });
+                requests_.push_back({ request_operation::deactivate, sender_id, {}, {} });
+            }
+            condition_.notify_one();
+        }
+
+        void publish(const nmos::id& sender_id, const web::json::value& state)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                requests_.push_back({ request_operation::publish, sender_id, {}, state });
             }
             condition_.notify_one();
         }
 
     private:
+        enum class request_operation { activate, deactivate, publish };
+
         struct request
         {
-            bool activate;
+            request_operation operation;
             nmos::id sender_id;
             web::json::value transport_params;
             web::json::value state;
@@ -2622,6 +2645,13 @@ namespace impl
                     requests_.pop_front();
                 }
 
+                if (request_operation::publish == next.operation)
+                {
+                    const auto found = senders_.find(next.sender_id);
+                    if (senders_.end() != found) found->second->publish_state(next.state);
+                    continue;
+                }
+
                 const auto found = senders_.find(next.sender_id);
                 if (senders_.end() != found)
                 {
@@ -2634,7 +2664,7 @@ namespace impl
                     previous.reset();
                 }
 
-                if (next.activate)
+                if (request_operation::activate == next.operation)
                 {
                     senders_.emplace(next.sender_id, std::make_unique<events_mqtt_sender>(next.sender_id, next.transport_params, next.state));
                 }
@@ -2665,6 +2695,11 @@ namespace impl
     void deactivate_mqtt_sender(const nmos::id& sender_id)
     {
         mqtt_sender_registry_instance().deactivate(sender_id);
+    }
+
+    void publish_mqtt_state(const nmos::id& sender_id, const web::json::value& state)
+    {
+        mqtt_sender_registry_instance().publish(sender_id, state);
     }
 
     // find interface with the specified address
