@@ -17,10 +17,12 @@ endif()
 
 set(MY_NMOS_NODE_SOURCES
     ${NMOS_CPP_DIRECTORY}/nmos-cpp-node/main.cpp
+    ${NMOS_CPP_DIRECTORY}/nmos-cpp-node/events_mqtt_sender.cpp
     ${NMOS_CPP_DIRECTORY}/nmos-cpp-node/node_implementation.cpp
     )
 set(MY_NMOS_NODE_HEADERS
     ${NMOS_CPP_DIRECTORY}/nmos-cpp-node/node_implementation.h
+    ${NMOS_CPP_DIRECTORY}/nmos-cpp-node/events_mqtt_sender.h
     )
 
 add_executable(
@@ -37,6 +39,13 @@ target_link_libraries(
     my-nmos-node
     nmos-cpp::compile-settings
     nmos-cpp::nmos-cpp
+    )
+
+target_compile_features(my-nmos-node PRIVATE cxx_std_17)
+
+# root directory to find e.g. nmos-cpp-node/events_mqtt_sender.h
+target_include_directories(my-nmos-node PRIVATE
+    ${NMOS_CPP_DIRECTORY}
     )
 
 # Generate a log file for each configuration of where the dependencies have been found
