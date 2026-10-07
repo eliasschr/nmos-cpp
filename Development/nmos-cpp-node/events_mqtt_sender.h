@@ -5,13 +5,18 @@
 #include "cpprest/json.h"
 #include "nmos/id.h"
 
+namespace slog
+{
+    class base_gate;
+}
+
 namespace impl
 {
     // Deliberately keeps Boost.MQTT5 out of the example-node interface.
     class events_mqtt_sender
     {
     public:
-        events_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state);
+        events_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state, slog::base_gate& gate);
         ~events_mqtt_sender();
 
         events_mqtt_sender(const events_mqtt_sender&) = delete;

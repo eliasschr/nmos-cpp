@@ -192,9 +192,10 @@ namespace impl
     bool is_ws_port(const port& port);
     bool is_mxl_port(const port& port);
     std::vector<port> parse_ports(const web::json::value& value);
-    void activate_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state);
+    void activate_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state, slog::base_gate& gate);
     void deactivate_mqtt_sender(const nmos::id& sender_id);
     void publish_mqtt_state(const nmos::id& sender_id, const web::json::value& state);
+    void shutdown_mqtt_senders();
 
     const std::vector<nmos::channel> channels_repeat{
         { U("Left Channel"), nmos::channel_symbols::L },
@@ -376,7 +377,7 @@ namespace impl
 }
 
 // forward declarations for node_implementation_thread
-void node_implementation_init(nmos::node_model& model, nmos::experimental::control_protocol_state& control_protocol_state, slog::base_gate& gate);
+void node_implementation_init(nmos::node_model& model, nmos::experimental::control_protocol_state& control_protocol_state, slog::base_gate& gate, slog::base_gate& mqtt_gate);
 void node_implementation_run(nmos::node_model& model, nmos::experimental::control_protocol_state& control_protocol_state, slog::base_gate& gate);
 nmos::connection_resource_auto_resolver make_node_implementation_auto_resolver(const nmos::settings& settings);
 nmos::connection_sender_transportfile_setter make_node_implementation_transportfile_setter(const nmos::resources& node_resources, const nmos::settings& settings);
@@ -392,7 +393,7 @@ void node_implementation_thread(nmos::node_model& model, nmos::experimental::con
 
     try
     {
-        node_implementation_init(model, control_protocol_state, gate);
+        node_implementation_init(model, control_protocol_state, gate, gate_);
         node_implementation_run(model, control_protocol_state, gate);
     }
     catch (const node_implementation_init_exception&)
@@ -420,9 +421,13 @@ void node_implementation_thread(nmos::node_model& model, nmos::experimental::con
     {
         slog::log<slog::severities::severe>(gate, SLOG_FLF) << "Unexpected unknown exception";
     }
+
+    // Destroy all MQTT senders before gate_ and the local category wrapper
+    // go out of scope, because their Asio callbacks use the original gate.
+    impl::shutdown_mqtt_senders();
 }
 
-void node_implementation_init(nmos::node_model& model, nmos::experimental::control_protocol_state& control_protocol_state, slog::base_gate& gate)
+void node_implementation_init(nmos::node_model& model, nmos::experimental::control_protocol_state& control_protocol_state, slog::base_gate& gate, slog::base_gate& mqtt_gate)
 {
     using web::json::value;
     using web::json::value_from_elements;
@@ -910,7 +915,7 @@ void node_implementation_init(nmos::node_model& model, nmos::experimental::contr
             if (!insert_resource_after(delay_millis, model.node_resources, std::move(sender), gate)) throw node_implementation_init_exception();
             if (!insert_resource_after(delay_millis, model.connection_resources, std::move(connection_sender), gate)) throw node_implementation_init_exception();
             if (!insert_resource_after(delay_millis, model.events_resources, std::move(events_source), gate)) throw node_implementation_init_exception();
-            if (mqtt_sender) impl::activate_mqtt_sender(sender_id, mqtt_transport_params, events_state);
+            if (mqtt_sender) impl::activate_mqtt_sender(sender_id, mqtt_transport_params, events_state, mqtt_gate);
         }
     }
 
@@ -2343,7 +2348,7 @@ nmos::connection_activation_handler make_node_implementation_connection_activati
 
             const auto& active = nmos::fields::endpoint_active(connection_resource.data);
             if (nmos::fields::master_enable(active))
-                impl::activate_mqtt_sender(resource.id, nmos::fields::transport_params(active), nmos::fields::endpoint_state(source->data));
+                impl::activate_mqtt_sender(resource.id, nmos::fields::transport_params(active), nmos::fields::endpoint_state(source->data), gate);
             else
                 impl::deactivate_mqtt_sender(resource.id);
         }
@@ -2583,22 +2588,18 @@ namespace impl
 
         ~mqtt_sender_registry()
         {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stopping_ = true;
-            }
-            condition_.notify_one();
-            if (worker_.joinable()) worker_.join();
+            shutdown();
         }
 
         mqtt_sender_registry(const mqtt_sender_registry&) = delete;
         mqtt_sender_registry& operator=(const mqtt_sender_registry&) = delete;
 
-        void activate(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
+        void activate(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state, slog::base_gate& gate)
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                requests_.push_back({ request_operation::activate, sender_id, transport_params, state });
+                if (stopping_) return;
+                requests_.push_back({ request_operation::activate, sender_id, transport_params, state, &gate });
             }
             condition_.notify_one();
         }
@@ -2607,7 +2608,8 @@ namespace impl
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                requests_.push_back({ request_operation::deactivate, sender_id, {}, {} });
+                if (stopping_) return;
+                requests_.push_back({ request_operation::deactivate, sender_id, {}, {}, nullptr });
             }
             condition_.notify_one();
         }
@@ -2616,9 +2618,20 @@ namespace impl
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                requests_.push_back({ request_operation::publish, sender_id, {}, state });
+                if (stopping_) return;
+                requests_.push_back({ request_operation::publish, sender_id, {}, state, nullptr });
             }
             condition_.notify_one();
+        }
+
+        void shutdown()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            condition_.notify_one();
+            if (worker_.joinable()) worker_.join();
         }
 
     private:
@@ -2630,6 +2643,7 @@ namespace impl
             nmos::id sender_id;
             web::json::value transport_params;
             web::json::value state;
+            slog::base_gate* gate;
         };
 
         void run()
@@ -2666,7 +2680,7 @@ namespace impl
 
                 if (request_operation::activate == next.operation)
                 {
-                    senders_.emplace(next.sender_id, std::make_unique<events_mqtt_sender>(next.sender_id, next.transport_params, next.state));
+                    senders_.emplace(next.sender_id, std::make_unique<events_mqtt_sender>(next.sender_id, next.transport_params, next.state, *next.gate));
                 }
             }
 
@@ -2687,9 +2701,9 @@ namespace impl
         return instance;
     }
 
-    void activate_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
+    void activate_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state, slog::base_gate& gate)
     {
-        mqtt_sender_registry_instance().activate(sender_id, transport_params, state);
+        mqtt_sender_registry_instance().activate(sender_id, transport_params, state, gate);
     }
 
     void deactivate_mqtt_sender(const nmos::id& sender_id)
@@ -2700,6 +2714,11 @@ namespace impl
     void publish_mqtt_state(const nmos::id& sender_id, const web::json::value& state)
     {
         mqtt_sender_registry_instance().publish(sender_id, state);
+    }
+
+    void shutdown_mqtt_senders()
+    {
+        mqtt_sender_registry_instance().shutdown();
     }
 
     // find interface with the specified address
