@@ -25,6 +25,9 @@
     // for MXL senders and receivers, the values must be like ["xv", "xa", "xd"]
     // when omitted, all ports are instantiated
     //"senders": ["v", "a"],
+    //"mqtt_senders": ["t"], // selected IS-07 sender ports use MQTT instead of WebSocket
+    //"mqtt_broker_host": "127.0.0.1",
+    //"mqtt_broker_port": 1883,
     //"receivers": [],
 
     // frame_rate: controls the grain_rate of video, audio and ancillary data sources and flows

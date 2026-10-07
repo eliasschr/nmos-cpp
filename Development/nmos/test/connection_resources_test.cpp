@@ -3,8 +3,10 @@
 
 #include "bst/test/test.h"
 #include "nmos/connection_api.h"
+#include "nmos/is05_versions.h"
 #include "nmos/json_fields.h"
 #include "nmos/resource.h"
+#include "nmos/settings.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 BST_TEST_CASE(testConnectionRtpParameterSets)
@@ -201,4 +203,35 @@ BST_TEST_CASE(testConnectionRtpOptionalParameterSetsResolveAuto)
         BST_REQUIRE_EQUAL(5002, nmos::fields::fec1D_destination_port(params).as_integer());
         BST_REQUIRE_EQUAL(5004, nmos::fields::fec2D_destination_port(params).as_integer());
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////
+BST_TEST_CASE(testConnectionEventsMqttSender)
+{
+    nmos::settings settings = web::json::value::object();
+    nmos::insert_node_default_settings(settings);
+
+    const auto sender_id = nmos::id{ U("sender") };
+    const auto source_id = nmos::id{ U("source") };
+    const auto resource = nmos::make_connection_events_mqtt_sender(sender_id, source_id, settings);
+    const auto& constraints = resource.data.at(nmos::fields::endpoint_constraints).at(0);
+    const auto& staged = resource.data.at(nmos::fields::endpoint_staged).at(nmos::fields::transport_params).at(0);
+
+    BST_REQUIRE_EQUAL(nmos::is05_versions::v1_1, resource.version);
+    BST_REQUIRE_EQUAL(nmos::types::sender, resource.type);
+    BST_REQUIRE(constraints.has_field(nmos::fields::destination_host));
+    BST_REQUIRE(constraints.has_field(nmos::fields::destination_port));
+    BST_REQUIRE(constraints.has_field(nmos::fields::broker_protocol));
+    BST_REQUIRE(constraints.has_field(nmos::fields::broker_authorization));
+    BST_REQUIRE(constraints.has_field(nmos::fields::broker_topic));
+    BST_REQUIRE(constraints.has_field(nmos::fields::connection_status_broker_topic));
+    BST_REQUIRE(constraints.has_field(nmos::fields::ext_is_07_rest_api_url));
+
+    BST_REQUIRE_EQUAL(U("auto"), nmos::fields::destination_host(staged).as_string());
+    BST_REQUIRE_EQUAL(U("auto"), nmos::fields::destination_port(staged).as_string());
+    BST_REQUIRE_EQUAL(U("mqtt"), nmos::fields::broker_protocol(staged).as_string());
+    BST_REQUIRE(!nmos::fields::broker_authorization(staged).as_bool());
+    BST_REQUIRE_EQUAL(nmos::make_events_mqtt_broker_topic(source_id, settings), nmos::fields::broker_topic(staged).as_string());
+    BST_REQUIRE_EQUAL(nmos::make_events_mqtt_connection_status_broker_topic(sender_id, settings), nmos::fields::connection_status_broker_topic(staged).as_string());
+    BST_REQUIRE_EQUAL(nmos::make_events_api_ext_is_07_rest_api_url(source_id, settings).to_string(), nmos::fields::ext_is_07_rest_api_url(staged).as_string());
 }

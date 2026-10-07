@@ -88,6 +88,8 @@ namespace nmos
     // See https://specs.amwa.tv/is-07/releases/v1.0.1/docs/5.2._Transport_-_Websocket.html#3-connection-management
     nmos::resource make_connection_events_websocket_sender(const nmos::id& id, const nmos::id& device_id, const nmos::id& source_id, const nmos::settings& settings);
     nmos::resource make_connection_events_websocket_receiver(const nmos::id& id, const nmos::settings& settings);
+    // IS-07 MQTT senders use the standard IS-05 MQTT transport parameters.
+    nmos::resource make_connection_events_mqtt_sender(const nmos::id& id, const nmos::id& source_id, const nmos::settings& settings);
 
     web::uri make_events_ws_api_connection_uri(const nmos::id& device_id, const nmos::settings& settings);
     web::uri make_events_api_ext_is_07_rest_api_url(const nmos::id& source_id, const nmos::settings& settings);

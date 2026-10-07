@@ -731,6 +731,35 @@ namespace nmos
         return{ is05_versions::v1_1, types::receiver, std::move(data), false };
     }
 
+    nmos::resource make_connection_events_mqtt_sender(const nmos::id& id, const nmos::id& source_id, const nmos::settings& settings)
+    {
+        using web::json::value;
+
+        auto data = details::make_connection_resource_core(id, false);
+
+        const auto broker_secure = false;
+        const auto broker_authorization = false;
+        const auto broker_topic = make_events_mqtt_broker_topic(source_id, settings);
+        const auto connection_status_broker_topic = make_events_mqtt_connection_status_broker_topic(id, settings);
+        const auto rest_api_url = make_events_api_ext_is_07_rest_api_url(source_id, settings);
+
+        auto constraints = details::make_connection_mqtt_sender_core_constraints(broker_secure, broker_authorization, broker_topic, connection_status_broker_topic);
+        auto ext_constraints = details::make_connection_events_mqtt_sender_ext_constraints(rest_api_url);
+        web::json::insert(constraints, ext_constraints.as_object().begin(), ext_constraints.as_object().end());
+        data[nmos::fields::endpoint_constraints] = details::legs_of(constraints, false);
+
+        data[nmos::fields::endpoint_staged][nmos::fields::receiver_id] = value::null();
+
+        auto transport_params = details::make_connection_mqtt_sender_staged_core_parameter_set(broker_secure, broker_authorization, broker_topic, connection_status_broker_topic);
+        auto ext_transport_params = details::make_connection_events_mqtt_sender_staged_ext_parameter_set(rest_api_url);
+        web::json::insert(transport_params, ext_transport_params.as_object().begin(), ext_transport_params.as_object().end());
+        data[nmos::fields::endpoint_staged][nmos::fields::transport_params] = details::legs_of(transport_params, false);
+
+        data[nmos::fields::endpoint_active] = data[nmos::fields::endpoint_staged];
+
+        return{ is05_versions::v1_1, types::sender, std::move(data), false };
+    }
+
     web::uri make_events_ws_api_connection_uri(const nmos::id& device_id, const nmos::settings& settings)
     {
         const auto version = *nmos::is07_versions::from_settings(settings).rbegin();

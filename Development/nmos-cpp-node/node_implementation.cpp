@@ -1,6 +1,11 @@
 #include "node_implementation.h"
 
+#include <condition_variable>
+#include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <boost/range/adaptor/filtered.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/transformed.hpp>
@@ -28,6 +33,7 @@
 #include "nmos/configuration_utils.h"
 #include "nmos/connection_resources.h"
 #include "nmos/connection_events_activation.h"
+#include "nmos-cpp-node/events_mqtt_sender.h"
 #include "nmos/control_protocol_resources.h"
 #include "nmos/control_protocol_resource.h"
 #include "nmos/control_protocol_state.h"
@@ -90,6 +96,11 @@ namespace impl
         // when omitted, all ports are instantiated
         const web::json::field_as_value_or senders{ U("senders"), {} };
         const web::json::field_as_value_or receivers{ U("receivers"), {} };
+        // MQTT is opt-in per existing IS-07 sender port. Omitting it preserves
+        // the historical all-WebSocket sender behaviour.
+        const web::json::field_as_value_or mqtt_senders{ U("mqtt_senders"), {} };
+        const web::json::field_as_string_or mqtt_broker_host{ U("mqtt_broker_host"), U("127.0.0.1") };
+        const web::json::field_as_integer_or mqtt_broker_port{ U("mqtt_broker_port"), 1883 };
 
         // frame_rate: controls the grain_rate of video, audio and ancillary data sources and flows
         // and the equivalent parameter constraint on video receivers
@@ -181,6 +192,8 @@ namespace impl
     bool is_ws_port(const port& port);
     bool is_mxl_port(const port& port);
     std::vector<port> parse_ports(const web::json::value& value);
+    void activate_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state);
+    void deactivate_mqtt_sender(const nmos::id& sender_id);
 
     const std::vector<nmos::channel> channels_repeat{
         { U("Left Channel"), nmos::channel_symbols::L },
@@ -427,6 +440,11 @@ void node_implementation_init(nmos::node_model& model, nmos::experimental::contr
     const auto sender_ports = impl::parse_ports(impl::fields::senders(model.settings));
     const auto rtp_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_rtp_port));
     const auto ws_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_ws_port));
+    const auto configured_mqtt_sender_ports = impl::parse_ports(impl::fields::mqtt_senders(model.settings));
+    const auto mqtt_sender_ports = boost::copy_range<std::vector<impl::port>>(ws_sender_ports | boost::adaptors::filtered([&](const impl::port& port)
+    {
+        return configured_mqtt_sender_ports.end() != boost::range::find(configured_mqtt_sender_ports, port);
+    }));
     const auto mxl_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_mxl_port));
     const auto receiver_ports = impl::parse_ports(impl::fields::receivers(model.settings));
     const auto rtp_receiver_ports = boost::copy_range<std::vector<impl::port>>(receiver_ports | boost::adaptors::filtered(impl::is_rtp_port));
@@ -871,21 +889,27 @@ void node_implementation_init(nmos::node_model& model, nmos::experimental::contr
             auto flow = nmos::make_json_data_flow(flow_id, source_id, device_id, event_type, model.settings);
             impl::set_label_description(flow, port, index);
 
-            auto sender = nmos::make_sender(sender_id, flow_id, nmos::transports::websocket, device_id, {}, { host_interface.name }, model.settings);
+            const auto mqtt_sender = mqtt_sender_ports.end() != boost::range::find(mqtt_sender_ports, port);
+            auto sender = nmos::make_sender(sender_id, flow_id, mqtt_sender ? nmos::transports::mqtt : nmos::transports::websocket, device_id, {}, { host_interface.name }, model.settings);
             impl::set_label_description(sender, port, index);
             impl::insert_group_hint(sender, port, index);
 
             // initialize this sender enabled, just to enable the IS-07-02 test suite to run immediately
-            auto connection_sender = nmos::make_connection_events_websocket_sender(sender_id, device_id, source_id, model.settings);
+            auto connection_sender = mqtt_sender
+                ? nmos::make_connection_events_mqtt_sender(sender_id, source_id, model.settings)
+                : nmos::make_connection_events_websocket_sender(sender_id, device_id, source_id, model.settings);
             connection_sender.data[nmos::fields::endpoint_active][nmos::fields::master_enable] = connection_sender.data[nmos::fields::endpoint_staged][nmos::fields::master_enable] = value::boolean(true);
             resolve_auto(sender, connection_sender, connection_sender.data[nmos::fields::endpoint_active][nmos::fields::transport_params]);
             nmos::set_resource_subscription(sender, nmos::fields::master_enable(connection_sender.data[nmos::fields::endpoint_active]), {}, nmos::tai_now());
+
+            const auto mqtt_transport_params = mqtt_sender ? connection_sender.data[nmos::fields::endpoint_active][nmos::fields::transport_params] : value::null();
 
             if (!insert_resource_after(delay_millis, model.node_resources, std::move(source), gate)) throw node_implementation_init_exception();
             if (!insert_resource_after(delay_millis, model.node_resources, std::move(flow), gate)) throw node_implementation_init_exception();
             if (!insert_resource_after(delay_millis, model.node_resources, std::move(sender), gate)) throw node_implementation_init_exception();
             if (!insert_resource_after(delay_millis, model.connection_resources, std::move(connection_sender), gate)) throw node_implementation_init_exception();
             if (!insert_resource_after(delay_millis, model.events_resources, std::move(events_source), gate)) throw node_implementation_init_exception();
+            if (mqtt_sender) impl::activate_mqtt_sender(sender_id, mqtt_transport_params, events_state);
         }
     }
 
@@ -2069,8 +2093,20 @@ nmos::connection_resource_auto_resolver make_node_implementation_auto_resolver(c
     const auto sender_ports = impl::parse_ports(impl::fields::senders(settings));
     const auto rtp_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_rtp_port));
     const auto rtp_sender_ids = impl::make_ids(seed_id, nmos::types::sender, rtp_sender_ports, how_many);
-    const auto ws_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_ws_port));
+    const auto configured_mqtt_sender_ports = impl::parse_ports(impl::fields::mqtt_senders(settings));
+    const auto all_ws_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_ws_port));
+    const auto mqtt_sender_ports = boost::copy_range<std::vector<impl::port>>(all_ws_sender_ports | boost::adaptors::filtered([&](const impl::port& port)
+    {
+        return configured_mqtt_sender_ports.end() != boost::range::find(configured_mqtt_sender_ports, port);
+    }));
+    const auto ws_sender_ports = boost::copy_range<std::vector<impl::port>>(all_ws_sender_ports | boost::adaptors::filtered([&](const impl::port& port)
+    {
+        return mqtt_sender_ports.end() == boost::range::find(mqtt_sender_ports, port);
+    }));
     const auto ws_sender_ids = impl::make_ids(seed_id, nmos::types::sender, ws_sender_ports, how_many);
+    const auto mqtt_sender_ids = impl::make_ids(seed_id, nmos::types::sender, mqtt_sender_ports, how_many);
+    const auto mqtt_broker_host = impl::fields::mqtt_broker_host(settings);
+    const auto mqtt_broker_port = impl::fields::mqtt_broker_port(settings);
     const auto mxl_sender_ports = boost::copy_range<std::vector<impl::port>>(sender_ports | boost::adaptors::filtered(impl::is_mxl_port));
     const auto mxl_sender_ids = impl::make_ids(seed_id, nmos::types::sender, mxl_sender_ports, how_many);
     const auto ws_sender_uri = nmos::make_events_ws_api_connection_uri(device_id, settings);
@@ -2084,7 +2120,7 @@ nmos::connection_resource_auto_resolver make_node_implementation_auto_resolver(c
 
     // although which properties may need to be defaulted depends on the resource type,
     // the default value will almost always be different for each resource
-    return [rtp_sender_ids, rtp_receiver_ids, ws_sender_ids, ws_sender_uri, ws_receiver_ids, mxl_sender_ids, mxl_receiver_ids](const nmos::resource& resource, const nmos::resource& connection_resource, value& transport_params)
+    return [rtp_sender_ids, rtp_receiver_ids, ws_sender_ids, ws_sender_uri, mqtt_sender_ids, mqtt_broker_host, mqtt_broker_port, ws_receiver_ids, mxl_sender_ids, mxl_receiver_ids](const nmos::resource& resource, const nmos::resource& connection_resource, value& transport_params)
     {
         const std::pair<nmos::id, nmos::type> id_type{ connection_resource.id, connection_resource.type };
         // this code relies on the specific constraints added by node_implementation_thread
@@ -2118,6 +2154,13 @@ nmos::connection_resource_auto_resolver make_node_implementation_auto_resolver(c
         else if (ws_receiver_ids.end() != boost::range::find(ws_receiver_ids, id_type.first))
         {
             nmos::details::resolve_auto(transport_params[0], nmos::fields::connection_authorization, [&] { return value::boolean(false); });
+        }
+        else if (mqtt_sender_ids.end() != boost::range::find(mqtt_sender_ids, id_type.first))
+        {
+            nmos::details::resolve_auto(transport_params[0], nmos::fields::destination_host, [&] { return value::string(mqtt_broker_host); });
+            nmos::details::resolve_auto(transport_params[0], nmos::fields::destination_port, [&] { return value::number(mqtt_broker_port); });
+            nmos::details::resolve_auto(transport_params[0], nmos::fields::broker_protocol, [&] { return value::string(U("mqtt")); });
+            nmos::details::resolve_auto(transport_params[0], nmos::fields::broker_authorization, [&] { return value::boolean(false); });
         }
         else if (mxl_sender_ids.end() != boost::range::find(mxl_sender_ids, id_type.first)
             || mxl_receiver_ids.end() != boost::range::find(mxl_receiver_ids, id_type.first))
@@ -2270,12 +2313,28 @@ nmos::connection_activation_handler make_node_implementation_connection_activati
     auto handle_close = nmos::experimental::make_events_ws_close_handler(model, gate);
     auto connection_events_activation_handler = nmos::make_connection_events_websocket_activation_handler(handle_load_ca_certificates, handle_events_ws_message, handle_close, model.settings, gate);
 
-    return [connection_events_activation_handler, &gate](const nmos::resource& resource, const nmos::resource& connection_resource)
+    return [connection_events_activation_handler, &model, &gate](const nmos::resource& resource, const nmos::resource& connection_resource)
     {
         const std::pair<nmos::id, nmos::type> id_type{ resource.id, resource.type };
         slog::log<slog::severities::info>(gate, SLOG_FLF) << nmos::stash_category(impl::categories::node_implementation) << "Activating " << id_type;
 
         connection_events_activation_handler(resource, connection_resource);
+
+        if (nmos::transports::mqtt == nmos::transport{ nmos::fields::transport(resource.data) })
+        {
+            const std::pair<nmos::id, nmos::type> flow_id_type{ nmos::fields::flow_id(resource.data).as_string(), nmos::types::flow };
+            const auto flow = nmos::find_resource(model.node_resources, flow_id_type);
+            const auto source = model.node_resources.end() == flow
+                ? model.events_resources.end()
+                : nmos::find_resource(model.events_resources, nmos::fields::source_id(flow->data));
+            if (model.events_resources.end() == source) return;
+
+            const auto& active = nmos::fields::endpoint_active(connection_resource.data);
+            if (nmos::fields::master_enable(active))
+                impl::activate_mqtt_sender(resource.id, nmos::fields::transport_params(active), nmos::fields::endpoint_state(source->data));
+            else
+                impl::deactivate_mqtt_sender(resource.id);
+        }
     };
 }
 
@@ -2503,6 +2562,111 @@ namespace impl
         }));
     }
 
+    class mqtt_sender_registry
+    {
+    public:
+        mqtt_sender_registry()
+            : worker_([this] { run(); })
+        {}
+
+        ~mqtt_sender_registry()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            condition_.notify_one();
+            if (worker_.joinable()) worker_.join();
+        }
+
+        mqtt_sender_registry(const mqtt_sender_registry&) = delete;
+        mqtt_sender_registry& operator=(const mqtt_sender_registry&) = delete;
+
+        void activate(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                requests_.push_back({ true, sender_id, transport_params, state });
+            }
+            condition_.notify_one();
+        }
+
+        void deactivate(const nmos::id& sender_id)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                requests_.push_back({ false, sender_id, {}, {} });
+            }
+            condition_.notify_one();
+        }
+
+    private:
+        struct request
+        {
+            bool activate;
+            nmos::id sender_id;
+            web::json::value transport_params;
+            web::json::value state;
+        };
+
+        void run()
+        {
+            for (;;)
+            {
+                request next;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    condition_.wait(lock, [this] { return stopping_ || !requests_.empty(); });
+                    if (requests_.empty()) break;
+                    next = std::move(requests_.front());
+                    requests_.pop_front();
+                }
+
+                const auto found = senders_.find(next.sender_id);
+                if (senders_.end() != found)
+                {
+                    // Remove ownership before teardown. The worker waits for the
+                    // old sender to finish before constructing a replacement, so a
+                    // sender ID can never have two live MQTT clients.
+                    auto previous = std::move(found->second);
+                    senders_.erase(found);
+                    previous->stop();
+                    previous.reset();
+                }
+
+                if (next.activate)
+                {
+                    senders_.emplace(next.sender_id, std::make_unique<events_mqtt_sender>(next.sender_id, next.transport_params, next.state));
+                }
+            }
+
+            senders_.clear();
+        }
+
+        std::mutex mutex_;
+        std::condition_variable condition_;
+        std::deque<request> requests_;
+        std::map<nmos::id, std::unique_ptr<events_mqtt_sender>> senders_;
+        bool stopping_{ false };
+        std::thread worker_;
+    };
+
+    mqtt_sender_registry& mqtt_sender_registry_instance()
+    {
+        static mqtt_sender_registry instance;
+        return instance;
+    }
+
+    void activate_mqtt_sender(const nmos::id& sender_id, const web::json::value& transport_params, const web::json::value& state)
+    {
+        mqtt_sender_registry_instance().activate(sender_id, transport_params, state);
+    }
+
+    void deactivate_mqtt_sender(const nmos::id& sender_id)
+    {
+        mqtt_sender_registry_instance().deactivate(sender_id);
+    }
+
     // find interface with the specified address
     std::vector<web::hosts::experimental::host_interface>::const_iterator find_interface(const std::vector<web::hosts::experimental::host_interface>& interfaces, const utility::string_t& address)
     {
@@ -2631,6 +2795,9 @@ namespace impl
 
         "senders":   { "type": "array", "items": { "$ref": "#/definitions/portKind" } },
         "receivers": { "type": "array", "items": { "$ref": "#/definitions/portKind" } },
+        "mqtt_senders":     { "type": "array", "items": { "$ref": "#/definitions/portKind" } },
+        "mqtt_broker_host": { "type": "string" },
+        "mqtt_broker_port": { "$ref": "#/definitions/positiveInteger" },
 
         "frame_rate":   { "$ref": "#/definitions/rational" },
         "frame_width":  { "$ref": "#/definitions/positiveInteger" },
